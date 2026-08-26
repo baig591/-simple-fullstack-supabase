@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - SUPABASE_URL=https://omhljgkfetuhslyohtnu.supabase.co
+      - SUPABASE_KEY=sb_publishable_gdsk0srqOETXGI9KY7S8_Q_NjDQYBUR
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
