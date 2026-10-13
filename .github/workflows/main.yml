@@ -1,3 +1,4 @@
+cat > .github/workflows/main.yml << 'EOF'
 name: CI-CD Pipeline
 
 on:
@@ -8,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # OIDC ke liye
+  id-token: write
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -16,15 +17,20 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # Apne project ke hisaab se badlein (npm/pytest etc.)
+
       - name: Backend tests
         working-directory: ./backend
         run: |
           npm ci
           npm test
+
+      - name: Dependency audit
+        working-directory: ./backend
+        run: npm audit --audit-level=critical
+
       - name: Frontend build check
         working-directory: ./frontend
         run: |
@@ -35,7 +41,7 @@ jobs:
     name: Build, Scan & Push
     needs: test
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         service: [backend, frontend]
@@ -52,28 +58,29 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set image name
+        run: echo "IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}" >> $GITHUB_ENV
+
       - name: Build image
-        env:
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
         run: docker build -t $IMAGE ./${{ matrix.service }}
 
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
+          image-ref: ${{ env.IMAGE }}
           severity: CRITICAL,HIGH
           exit-code: 1
           ignore-unfixed: true
 
       - name: Push image
-        run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
+        run: docker push $IMAGE
 
   deploy:
     name: Deploy to AWS
     needs: build-scan-push
-    runs-on: ubuntu-latest
-    environment: production   # manual approval laga sakte hain
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: production
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -92,3 +99,4 @@ jobs:
         run: |
           sleep 20
           curl --fail --retry 5 --retry-delay 5 http://${{ secrets.APP_HOST }}/health
+EOF
