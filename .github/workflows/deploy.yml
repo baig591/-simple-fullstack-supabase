@@ -1,48 +1,94 @@
-name: Build and Push Docker Images to ECR
+name: CI-CD Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write   # OIDC ke liye
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
-  build-and-push:
-    name: Build & Push
+  test:
+    name: Test
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      # Apne project ke hisaab se badlein (npm/pytest etc.)
+      - name: Backend tests
+        working-directory: ./backend
+        run: |
+          npm ci
+          npm test
+      - name: Frontend build check
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run build
 
-      - name: Configure AWS Credentials
+  build-scan-push:
+    name: Build, Scan & Push
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Log in to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push Backend Image
+      - name: Build image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG ./backend
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
+        run: docker build -t $IMAGE ./${{ matrix.service }}
 
-      - name: Build and Push Frontend Image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Push image
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG ./frontend
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}
+
+  deploy:
+    name: Deploy to AWS
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    environment: production   # manual approval laga sakte hain
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy on EC2 via SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /home/ubuntu/app","export TAG=${{ github.sha }}","docker compose pull","docker compose up -d"]'
+
+      - name: Verify deployment
+        run: |
+          sleep 20
+          curl --fail --retry 5 --retry-delay 5 http://${{ secrets.APP_HOST }}/health
