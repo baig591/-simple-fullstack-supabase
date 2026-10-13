@@ -8,10 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
   test:
@@ -41,24 +37,17 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         service: [backend, frontend]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
       - name: Set image name
-        run: echo "IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ matrix.service }}-${{ github.sha }}" >> $GITHUB_ENV
+        run: echo "IMAGE=ghcr.io/${{ github.repository_owner }}/simple-fullstack-supabase-${{ matrix.service }}:${{ github.sha }}" >> $GITHUB_ENV
 
       - name: Build image
         run: docker build -t $IMAGE ./${{ matrix.service }}
@@ -73,30 +62,8 @@ jobs:
             --ignore-unfixed \
             $IMAGE
 
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: Push image
         run: docker push $IMAGE
-
-  deploy:
-    name: Deploy to AWS
-    needs: build-scan-push
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    environment: production
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy on EC2 via SSM
-        run: |
-          aws ssm send-command \
-            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["cd /home/ubuntu/app","export TAG=${{ github.sha }}","docker compose pull","docker compose up -d"]'
-
-      - name: Verify deployment
-        run: |
-          sleep 20
-          curl --fail --retry 5 --retry-delay 5 http://${{ secrets.APP_HOST }}/health
